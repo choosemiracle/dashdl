@@ -18,6 +18,8 @@
 | [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE/releases) | ✅ | 下载官方 macOS 二进制，放入 `~/bin` 并加入 PATH |
 | ffmpeg / ffprobe | ✅ | `brew install ffmpeg` |
 | mp4decrypt（[Bento4](https://www.bento4.com/)） | 推荐 | `brew install bento4` |
+| pywidevine（仅 `--firefox` / `--get-key`） | 可选 | `pip install pywidevine` |
+| selenium + geckodriver（仅 `--firefox`） | 可选 | `pip install selenium` + `brew install geckodriver` |
 
 > 解密引擎可选 `FFMPEG` / `MP4DECRYPT` / `SHAKA_PACKAGER`，默认 `MP4DECRYPT`。
 
@@ -125,6 +127,46 @@ N_m3u8DL-RE 天然支持：**重新运行同一条命令**即可。已下载的�
 
 ---
 
+## 自动取 key（Widevine / Firefox）
+
+默认情况下你需要手动提供 `--key KID:KEY`。`dashdl` 还能自动完成「取 key」这一步——驱动你装了 [widevine-l3-decrypter](https://addons.mozilla.org/en-US/firefox/addon/widevine-l3-decrypter/) 扩展的 Firefox，抓取 license 请求 + PSSH + MPD，再用本机 pywidevine 派生 key。
+
+### 原理
+
+该 Firefox 扩展内部其实打包了一个 `device.wvd`（Widevine L3 设备）并用 pywidevine 算 key。`dashdl` 把这个设备文件自动抽取到 `~/.config/dashdl/device.wvd`，然后**脱离浏览器**用本机 pywidevine 完成同样的派生。Firefox 只负责一件事：在页面播放时把 license 请求（URL + headers）、PSSH 和 MPD 地址抓下来。
+
+### 一键下载
+
+```bash
+dashdl "https://…/视频页面" --firefox
+```
+
+流程：驱动 Firefox 打开页面 → 捕获 PSSH/license/MPD → 派生 key → 自动下载解密封装。
+
+```bash
+# 指定 profile / 等待秒数 / 下载参数
+dashdl "https://…/视频页面" --firefox --profile ~/Library/Application\ Support/Firefox/Profiles/xxx.default-release \
+  --wait 60 --res 1080 -o ~/Movies/片名.mp4
+```
+
+> - `--firefox` 会**复制一份 profile** 到临时目录来跑（不动你正在用的 Firefox，也不污染原 profile），用完自动清理。登录态（cookies）、Widevine CDM、扩展都会带过来。
+> - DRM 页通常不支持 `--headless`，默认就是有头模式。
+> - 若页面不自动播放，先手动点一下播放，或把 `--wait` 调大。
+
+### 只取 key（半自动）
+
+如果你已经有 PSSH 和 license 地址（比如从 DevTools 网络面板里拿到），可以直接派生 key 而不开浏览器：
+
+```bash
+dashdl --get-key --pssh "AAAX…" --license-url "https://…/license" -H "Authorization: Bearer …"
+```
+
+输出 `KID:KEY`，再拿去 `dashdl "…dash.mpd" --key KID:KEY` 下载。
+
+> `--get-key` 模式可省略 URL 位置参数；`--wvd` 可手动指定设备文件，否则自动从扩展抽取。
+
+---
+
 ## 完整参数
 
 ```
@@ -142,7 +184,10 @@ usage: dashdl [-h] [--key KEY] [--key-file KEY_FILE] [--hls-key HLS_KEY]
               [--append-url-params] [--proxy PROXY] [--no-proxy]
               [--threads THREADS] [--concurrent] [--retries RETRIES]
               [--timeout TIMEOUT] [--max-speed MAX_SPEED]
-              [--decrypt-engine {FFMPEG,MP4DECRYPT,SHAKA_PACKAGER}] [--list]
+              [--decrypt-engine {FFMPEG,MP4DECRYPT,SHAKA_PACKAGER}]
+              [--firefox] [--get-key] [--wvd WVD] [--pssh PSSH]
+              [--license-url LICENSE_URL] [--profile PROFILE] [--wait WAIT]
+              [--headless] [--list]
               [--dry-run] [--binary BINARY]
               url
 ```
@@ -154,6 +199,7 @@ usage: dashdl [-h] [--key KEY] [--key-file KEY_FILE] [--hls-key HLS_KEY]
 - **输出**：`-o/--output`、`--dir`、`--name`、`--format`、`--tmp-dir`、`--no-mux`、`--keep-files`
 - **网络**：`-H/--header`、`--cookie`、`--user-agent`、`--referer`、`--append-url-params`、`--proxy`、`--no-proxy`
 - **性能/解密**：`--threads`、`--concurrent`、`--retries`、`--timeout`、`--max-speed`、`--decrypt-engine`
+- **Widevine/Firefox 自动取 key**：`--firefox`（驱动 Firefox 自动取 key 后下载）、`--get-key`（只派生 key）、`--wvd`、`--pssh`、`--license-url`、`--profile`、`--wait`、`--headless`
 - **其他**：`--list`（只列轨道）、`--dry-run`（只打印命令）、`--binary`
 
 ---

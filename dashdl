@@ -345,6 +345,86 @@ def build_command(args, binary, tracks=None):
     return cmd
 
 
+# ───────────────────────── Widevine / Firefox 取 key ─────────────────────────
+
+def _headers_from_args(args):
+    h = {}
+    for x in args.header:
+        if ":" in x:
+            kk, vv = x.split(":", 1)
+            h[kk.strip()] = vv.strip()
+    if args.cookie:
+        h["Cookie"] = args.cookie
+    if args.user_agent:
+        h["User-Agent"] = args.user_agent
+    if args.referer:
+        h["Referer"] = args.referer
+    return h
+
+
+def _load_widevine_module():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "dashdl_widevine.py"),
+                 os.path.join(os.path.expanduser("~/bin"), "dashdl_widevine.py")):
+        if os.path.isfile(cand):
+            spec = importlib.util.spec_from_file_location("dashdl_widevine", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    sys.exit("错误: 找不到 dashdl_widevine.py（应与 dashdl 同目录）")
+
+
+def _widevine_main(args):
+    wv = _load_widevine_module()
+
+    if args.get_key:
+        if not (args.pssh and args.license_url):
+            sys.exit("错误: --get-key 需要 --pssh 与 --license-url")
+        dev = wv.find_device_wvd(args.wvd)
+        if not dev:
+            sys.exit("错误: 找不到 device.wvd（用 --wvd 指定路径）")
+        keys = wv.derive_keys(dev, args.pssh, args.license_url, _headers_from_args(args))
+        if not keys:
+            sys.exit("错误: 未能派生 key")
+        print("派生 key:")
+        for kid, kk in keys:
+            print(f"  {kid}:{kk}")
+        return 0
+
+    # --firefox
+    print("正在驱动 Firefox 捕获 Widevine 信息...")
+    cap = wv.firefox_capture(args.url, profile_dir=args.profile,
+                             wait=args.wait, headless=args.headless)
+    pssh = cap.get("pssh")
+    lic = wv.pick_license(cap)
+    mpds = cap.get("mpds") or []
+    if not pssh:
+        sys.exit("错误: 未捕获到 PSSH（页面未触发 DRM 播放；可加 --wait 或先手动点播放）")
+    if not lic or not lic.get("url"):
+        sys.exit("错误: 未捕获到 license 请求")
+    if not mpds:
+        sys.exit("错误: 未捕获到 MPD 地址")
+    dev = wv.find_device_wvd(args.wvd)
+    if not dev:
+        sys.exit("错误: 找不到 device.wvd（用 --wvd 指定路径）")
+    print(f"派生 key（device={dev}）...")
+    keys = wv.derive_keys(dev, pssh, lic["url"], lic.get("headers"))
+    if not keys:
+        sys.exit("错误: 未能派生 key")
+    print("已派生 key:")
+    for kid, kk in keys:
+        print(f"  {kid}:{kk}")
+    page_url = args.url
+    args.url = mpds[-1]
+    for kid, kk in keys:
+        args.key.append(f"{kid}:{kk}")
+    if args.referer is None:
+        args.referer = page_url
+    print(f"\n开始下载 MPD: {args.url}\n")
+    return None  # 继续走 main() 的下载流程
+
+
 # ───────────────────────── 主流程 ─────────────────────────
 
 def main():
@@ -354,7 +434,7 @@ def main():
         description=__doc__.split("────────────────")[0],
         epilog="示例见脚本头部注释 (dashdl --help 也显示)."
     )
-    p.add_argument("url", help="MPD/m3u8 的 URL 或本地文件路径")
+    p.add_argument("url", nargs="?", help="MPD/m3u8 的 URL 或本地文件路径")
 
     # 密钥
     k = p.add_argument_group("密钥")
@@ -414,6 +494,19 @@ def main():
     x.add_argument("--decrypt-engine", choices=["FFMPEG", "MP4DECRYPT", "SHAKA_PACKAGER"],
                    default="MP4DECRYPT", help="解密引擎 (默认 MP4DECRYPT)")
 
+    # Widevine / Firefox 自动取 key
+    w = p.add_argument_group("Widevine / Firefox 自动取 key (依赖: pywidevine, selenium)")
+    w.add_argument("--firefox", action="store_true",
+                   help="驱动 Firefox 打开视频页面, 自动抓 PSSH+license+MPD 并派生 key 后下载")
+    w.add_argument("--get-key", action="store_true",
+                   help="只派生并打印 key (需 --pssh + --license-url)")
+    w.add_argument("--wvd", help="device.wvd 路径 (默认自动从 widevine-l3-decrypter 扩展抽取)")
+    w.add_argument("--pssh", help="PSSH (base64 或 hex), 配合 --get-key")
+    w.add_argument("--license-url", help="license 服务器 URL, 配合 --get-key")
+    w.add_argument("--profile", help="Firefox profile 目录 (默认自动选 default-release)")
+    w.add_argument("--wait", type=int, default=45, help="Firefox 捕获等待秒数 (默认 45)")
+    w.add_argument("--headless", action="store_true", help="Firefox 无头模式 (DRM 页通常不支持)")
+
     # 其他
     m = p.add_argument_group("其他")
     m.add_argument("--list", action="store_true", help="只列出可用轨道, 不下载")
@@ -421,6 +514,14 @@ def main():
     m.add_argument("--binary", default=N_M3U8DL_RE, help="N_m3u8DL-RE 可执行文件路径")
 
     args = p.parse_args()
+
+    if not args.url and not args.get_key:
+        p.error("需要提供 URL")
+
+    if args.firefox or args.get_key:
+        rc = _widevine_main(args)
+        if rc is not None:
+            sys.exit(rc)
 
     # 输出路径处理
     if args.output:

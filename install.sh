@@ -9,6 +9,7 @@ TARGET="${BIN_DIR}/dashdl"
 # 1) 安装脚本
 mkdir -p "${BIN_DIR}"
 cp "${HERE}/dashdl" "${TARGET}"
+cp "${HERE}/dashdl_widevine.py" "${BIN_DIR}/dashdl_widevine.py"
 chmod +x "${TARGET}"
 
 # 2) 确保 ~/bin 在 PATH（zsh/bash 常见配置）
