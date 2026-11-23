@@ -224,6 +224,14 @@ def _copy_profile(src):
         return [n for n in names
                 if n in _PROFILE_IGNORE or n.endswith((".lock",))]
     shutil.copytree(src, dst, ignore=_ignore, dirs_exist_ok=True)
+    # 关闭会话恢复/首次运行弹窗，避免慢启动
+    with open(os.path.join(dst, "user.js"), "w") as f:
+        f.write('user_pref("browser.sessionstore.resume_from_crash", false);\n'
+                'user_pref("browser.startup.page", 0);\n'
+                'user_pref("browser.sessionstore.max_tabs_undo", 0);\n'
+                'user_pref("app.normandy.first_run", false);\n'
+                'user_pref("browser.shell.checkDefaultBrowser", false);\n'
+                'user_pref("datareporting.policy.firstRunURL", "");\n')
     return dst
 
 
@@ -236,6 +244,7 @@ def firefox_capture(url, profile_dir=None, wait=45, poll=1.0, binary=FIREFOX_APP
     try:
         from selenium import webdriver
         from selenium.webdriver.firefox.options import Options
+        from selenium.webdriver.firefox.service import Service
     except ImportError:
         raise RuntimeError("未安装 selenium（pip install selenium）")
 
@@ -251,12 +260,19 @@ def firefox_capture(url, profile_dir=None, wait=45, poll=1.0, binary=FIREFOX_APP
 
     opts = Options()
     opts.binary_location = binary
+    # SPA 页面可能永不触发 load 事件，用 eager 在 DOMContentLoaded 后就返回，
+    # 既避免挂起，又能更早注入捕获钩子
+    opts.page_load_strategy = "eager"
     if headless:
         opts.add_argument("--headless")
     opts.add_argument("-profile")
     opts.add_argument(work_profile)
 
-    driver = webdriver.Firefox(options=opts)
+    # 直接指定 geckodriver 路径，绕开 Selenium Manager 的联网版本检查
+    # （在访问 github 受限的网络下，联网检查会挂起数分钟）
+    gecko = shutil.which("geckodriver")
+    service = Service(executable_path=gecko) if gecko else None
+    driver = webdriver.Firefox(options=opts, service=service)
     try:
         driver.get(url)
         time.sleep(1)
