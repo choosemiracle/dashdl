@@ -1,0 +1,20 @@
+# 下载产物 / 日志 / 密钥 —— 切勿提交
+*.mp4
+*.mkv
+*.ts
+*.m4s
+*.m4a
+*.m4v
+*.log
+*.mpd
+*.m3u8
+keys.txt
+key*.txt
+*.key
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

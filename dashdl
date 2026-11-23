@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dashdl — N_m3u8DL-RE 万能下载封装
+==================================
+
+一条命令下载带密钥的 DASH(MPD) / HLS(m3u8) 视频，自动解密、选流、封装。
+支持 CENC(Widevine/PlayReady) 与 HLS AES-128 两类加密。
+
+依赖: N_m3u8DL-RE (必须), ffmpeg (封装), mp4decrypt/shaka-packager (解密, 可选)
+macOS:  brew install ffmpeg bento4   # bento4 提供 mp4decrypt
+        (N_m3u8DL-RE 从 GitHub nilaoda/N_m3u8DL-RE 下载)
+
+────────────────────────────────────────────────────────────
+【用法速览】
+────────────────────────────────────────────────────────────
+  # 1) 最简：给 URL + 密钥，自动下载最佳画质(视频+音频, 不含字幕)
+  dashdl "https://…/dash.mpd" --key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+  # 2) 先看有哪些清晰度/音轨/字幕(只解析, 不下载)
+  dashdl "https://…/dash.mpd" --list
+
+  # 3) 指定分辨率(高度) / 多个候选 / 指定编码
+  dashdl "…/dash.mpd" --key …:… --res 1080
+  dashdl "…/dash.mpd" --key …:… --res 720,1080
+  dashdl "…/dash.mpd" --key …:… --res 1080 --video-codec hvc1
+
+  # 4) 指定输出目录 / 文件名 / 封装格式
+  dashdl "…/dash.mpd" --key …:… -o ~/Movies/film.mp4
+  dashdl "…/dash.mpd" --key …:… --dir ~/Movies --name film --format mkv
+
+  # 5) 指定音频语言 / 音轨编码 / 字幕语言
+  dashdl "…/dash.mpd" --key …:… --audio-lang chi,eng --sub-lang chi
+
+  # 6) 带 Cookie / Referer / UA 的签名地址
+  dashdl "…/dash.mpd" --key …:… -H "Cookie: …" -H "Referer: …"
+
+  # 7) 只下视频 / 只下音频 / 只下字幕
+  dashdl "…/dash.mpd" --key …:… --video-only
+  dashdl "…/dash.mpd" --key …:… --audio-only
+  dashdl "…/dash.mpd" --key …:… --sub-only --sub-lang chi
+
+  # 8) HLS AES-128 加密(给 16 字节 key/iv 的 hex 或文件路径)
+  dashdl "…/index.m3u8" --hls-key bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --hls-iv 00000000000000000000000000000000
+
+  # 9) 多个密钥 / 密钥文件
+  dashdl "…/dash.mpd" --key KID1:KEY1 --key KID2:KEY2
+  dashdl "…/dash.mpd" --key-file keys.txt     # 每行一条 KID:KEY
+
+  # 10) 预览将执行的命令(不下载)
+  dashdl "…/dash.mpd" --key …:… --dry-run
+
+────────────────────────────────────────────────────────────
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+
+N_M3U8DL_RE = shutil.which("N_m3u8DL-RE") or "N_m3u8DL-RE"
+
+# 分辨率标签 → 高度
+HEIGHT_ALIASES = {
+    "4k": 2160, "2k": 1440, "1440p": 1440, "1080p": 1080,
+    "720p": 720, "480p": 480, "360p": 360, "240p": 240,
+}
+
+
+# ───────────────────────── 工具函数 ─────────────────────────
+
+def resolve_height(s):
+    """'1080' / '1080p' / '4k' / '2k' → 高度数值"""
+    s = s.strip().lower()
+    if s in HEIGHT_ALIASES:
+        return HEIGHT_ALIASES[s]
+    m = re.fullmatch(r"(\d+)p?", s)
+    if m:
+        return int(m.group(1))
+    raise ValueError(f"无法解析分辨率: {s!r}")
+
+
+def hls_attrs(line):
+    """解析 #EXT-X-… 行里的 KEY=VALUE 属性(兼容引号与逗号)"""
+    body = line.split(":", 1)[1] if ":" in line else ""
+    attrs = {}
+    for k, v in re.findall(r'([A-Z0-9-]+)=("(?:[^"]*)"|[^,]*)', body):
+        attrs[k] = v.strip('"')
+    return attrs
+
+
+def fetch(url, headers, timeout=30):
+    """URL 则抓取, 本地文件则读取"""
+    if url.startswith(("http://", "https://")):
+        hdr = {"User-Agent": "dashdl/1.0", **headers}
+        req = urllib.request.Request(url, headers=hdr)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    with open(url, "rb") as f:
+        return f.read()
+
+
+# ───────────────────────── 清单解析 ─────────────────────────
+
+def parse_mpd(data):
+    root = ET.fromstring(data)
+    tracks = []
+    for aset in root.iter():
+        if aset.tag.split("}")[-1] != "AdaptationSet":
+            continue
+        aset_mime = aset.get("mimeType") or aset.get("contentType")
+        aset_lang = aset.get("lang")
+        for rep in aset:
+            if rep.tag.split("}")[-1] != "Representation":
+                continue
+            mime = rep.get("mimeType") or aset_mime
+            codecs = rep.get("codecs")
+            w, h = rep.get("width"), rep.get("height")
+            res = f"{w}x{h}" if w and h else None
+            bw = rep.get("bandwidth")
+            fr = rep.get("frameRate")
+            sr = rep.get("audioSamplingRate")
+            rid = rep.get("id")
+            t = "unknown"
+            if mime:
+                if mime.startswith("video"):
+                    t = "video"
+                elif mime.startswith("audio"):
+                    t = "audio"
+                elif "ttml" in mime or "vtt" in mime or "subtitle" in mime or "caption" in mime:
+                    t = "subtitle"
+            if t == "unknown" and codecs:
+                if codecs.startswith(("avc", "hvc", "hev", "av0", "vp")):
+                    t = "video"
+                elif codecs.startswith(("mp4a", "ac-3", "ec-3", "opus", "flac", "dts")):
+                    t = "audio"
+                elif codecs.startswith(("wvtt", "stpp", "tx3g")):
+                    t = "subtitle"
+            tracks.append({
+                "type": t, "id": rid, "lang": aset_lang, "codecs": codecs,
+                "resolution": res, "height": int(h) if h else None,
+                "bandwidth": int(bw) if bw else None,
+                "framerate": fr, "samplerate": sr,
+            })
+    return tracks
+
+
+def parse_m3u8(text):
+    media = {}
+    tracks = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MEDIA:"):
+            a = hls_attrs(line)
+            media[(a.get("TYPE", "").upper(), a.get("GROUP-ID", ""))] = a
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            a = hls_attrs(line)
+            res = a.get("RESOLUTION")
+            h = int(res.split("x")[1]) if res and "x" in res else None
+            bw = a.get("BANDWIDTH")
+            codecs = a.get("CODECS")
+            tracks.append({
+                "type": "video", "id": a.get("NAME") or bw, "lang": None,
+                "codecs": codecs, "resolution": res, "height": h,
+                "bandwidth": int(bw) if bw else None,
+                "framerate": a.get("FRAME-RATE"), "samplerate": None,
+            })
+            for (t, gid), m in media.items():
+                if t == "AUDIO" and gid == a.get("AUDIO"):
+                    tracks.append({
+                        "type": "audio", "id": m.get("NAME"), "lang": m.get("LANGUAGE"),
+                        "codecs": None, "resolution": None, "height": None,
+                        "bandwidth": None, "framerate": None, "samplerate": None,
+                    })
+                if t == "SUBTITLES" and gid == a.get("SUBTITLES"):
+                    tracks.append({
+                        "type": "subtitle", "id": m.get("NAME"), "lang": m.get("LANGUAGE"),
+                        "codecs": None, "resolution": None, "height": None,
+                        "bandwidth": None, "framerate": None, "samplerate": None,
+                    })
+    return tracks
+
+
+def print_tracks(tracks):
+    if not tracks:
+        print("(未解析到任何轨道)")
+        return
+    hdr = f"{'类型':<8} {'ID':<12} {'语言':<6} {'分辨率':<12} {'编码':<22} {'码率':>9}  {'帧率/采样'}"
+    print(hdr)
+    print("-" * len(hdr))
+    seen = set()
+    for t in tracks:
+        key = (t["type"], t["id"], t["lang"], t["resolution"], t["bandwidth"])
+        if key in seen:
+            continue
+        seen.add(key)
+        type_cn = {"video": "视频", "audio": "音频", "subtitle": "字幕", "unknown": "?"}[t["type"]]
+        bw = f"{t['bandwidth']//1000}k" if t["bandwidth"] else ""
+        extra = t["framerate"] or (f"{int(t['samplerate'])//1000}kHz" if t["samplerate"] else "")
+        print(f"{type_cn:<8} {str(t['id']):<12} {str(t['lang'] or ''):<6} "
+              f"{str(t['resolution'] or ''):<12} {str(t['codecs'] or ''):<22} "
+              f"{bw:>9}  {extra}")
+    print("\n可用高度:", ", ".join(
+        f"{h}p" for h in sorted({t["height"] for t in tracks if t["height"]}, reverse=True)))
+
+
+# ───────────────────────── 选择器构建 ─────────────────────────
+
+def build_selection(args, tracks):
+    """返回 N_m3u8DL-RE 的选流参数列表 (-sv/-sa/-ss/--sub-only)"""
+    sel = []
+
+    want_video = not (args.audio_only or args.sub_only)
+    want_audio = not (args.video_only or args.sub_only)
+    want_sub = bool(args.sub_only or args.subs or args.sub_lang)
+
+    # 分辨率 → 高度集合(用于 --max-res 自动发现)
+    available_heights = sorted({t["height"] for t in tracks if t["height"] and t["type"] == "video"}, reverse=True)
+
+    sv, sa, ss = [], [], []
+
+    if args.res:
+        heights = sorted({resolve_height(x) for x in args.res.split(",")}, reverse=True)
+        sv.append("res=.*x" + ("(" + "|".join(str(h) for h in heights) + ")" if len(heights) > 1 else str(heights[0])))
+    if args.max_res is not None:
+        cap = resolve_height(args.max_res)
+        allowed = [h for h in available_heights if h <= cap]
+        if allowed:
+            sv.append("res=.*x" + ("(" + "|".join(str(h) for h in allowed) + ")" if len(allowed) > 1 else str(allowed[0])))
+        else:
+            sys.exit(f"错误: 没有 ≤{cap}p 的视频流 (可用: {available_heights or '无'})")
+    if args.video_codec:
+        sv.append(f"codecs={args.video_codec}")
+
+    if args.audio_lang:
+        sa.append("lang=" + "|".join(x.strip() for x in args.audio_lang.split(",")))
+    if args.audio_codec:
+        sa.append(f"codecs={args.audio_codec}")
+
+    if args.sub_lang:
+        ss.append("lang=" + "|".join(x.strip() for x in args.sub_lang.split(",")))
+
+    def emit(flag, filters, all_mode):
+        nonlocal sel
+        if all_mode:
+            sel += [flag, "all"]
+        elif filters:
+            sel += [flag, ":".join(filters)]
+        else:
+            sel += [flag, "best"]
+
+    if want_video:
+        emit("-sv", sv, args.video_all)
+    if want_audio:
+        emit("-sa", sa, args.audio_all)
+    if want_sub:
+        if args.sub_only and not ss:
+            sel += ["--sub-only"]
+        else:
+            emit("-ss", ss, args.sub_all)
+            if args.sub_only:
+                sel += ["--sub-only"]
+
+    # 丢弃过滤
+    for r in args.drop_video:
+        sel += ["-dv", r]
+    for r in args.drop_audio:
+        sel += ["-da", r]
+    for r in args.drop_sub:
+        sel += ["-ds", r]
+
+    return sel
+
+
+# ───────────────────────── 命令行构建 ─────────────────────────
+
+def build_command(args, binary, tracks=None):
+    cmd = [binary, args.url]
+
+    # 密钥
+    for k in args.key:
+        cmd += ["--key", k]
+    if args.key_file:
+        cmd += ["--key-text-file", args.key_file]
+    if args.hls_key:
+        cmd += ["--custom-hls-key", args.hls_key]
+    if args.hls_iv:
+        cmd += ["--custom-hls-iv", args.hls_iv]
+    if args.hls_method:
+        cmd += ["--custom-hls-method", args.hls_method]
+
+    # 选流
+    cmd += build_selection(args, tracks or [])
+
+    # 输出
+    cmd += ["--save-dir", args.dir, "--save-name", args.name]
+    if args.tmp_dir:
+        cmd += ["--tmp-dir", args.tmp_dir]
+
+    # 封装
+    mux = []
+    if args.format:
+        mux.append(f"format={args.format}")
+    if args.keep_files:
+        mux.append("keep=true")
+    if not args.no_mux and mux:
+        cmd += ["--mux-after-done", ":".join(mux)]
+
+    # 网络 / header
+    for h in args.header:
+        cmd += ["-H", h]
+    if args.cookie:
+        cmd += ["-H", f"Cookie: {args.cookie}"]
+    if args.user_agent:
+        cmd += ["-H", f"User-Agent: {args.user_agent}"]
+    if args.referer:
+        cmd += ["-H", f"Referer: {args.referer}"]
+    if args.append_url_params:
+        cmd += ["--append-url-params"]
+    if args.proxy:
+        cmd += ["--custom-proxy", args.proxy]
+    if args.no_proxy:
+        cmd += ["--use-system-proxy", "false"]
+
+    # 性能
+    cmd += ["--thread-count", str(args.threads),
+            "--download-retry-count", str(args.retries),
+            "--http-request-timeout", str(args.timeout)]
+    if args.concurrent:
+        cmd += ["--concurrent-download"]
+    if args.max_speed:
+        cmd += ["--max-speed", args.max_speed]
+
+    # 解密引擎
+    if args.decrypt_engine:
+        cmd += ["--decryption-engine", args.decrypt_engine]
+
+    cmd += ["--no-ansi-color"]
+    return cmd
+
+
+# ───────────────────────── 主流程 ─────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="dashdl",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__.split("────────────────")[0],
+        epilog="示例见脚本头部注释 (dashdl --help 也显示)."
+    )
+    p.add_argument("url", help="MPD/m3u8 的 URL 或本地文件路径")
+
+    # 密钥
+    k = p.add_argument_group("密钥")
+    k.add_argument("--key", action="append", default=[],
+                   help="CENC 密钥, 格式 KID:KEY (可重复; 全部同 key 时可只给 KEY)")
+    k.add_argument("--key-file", help="KID:KEY 文本文件(每行一条)")
+    k.add_argument("--hls-key", help="HLS AES-128 密钥(hex 或文件路径)")
+    k.add_argument("--hls-iv", help="HLS AES-128 IV(hex 或文件路径, 默认全0)")
+    k.add_argument("--hls-method", help="强制 HLS 加密方式 (AES_128/CENC/SAMPLE_AES…)")
+
+    # 选流
+    s = p.add_argument_group("选流 (默认: 最佳视频+最佳音频, 不含字幕)")
+    s.add_argument("--res", help="按高度选视频, 逗号分隔, 如 1080 或 720,1080")
+    s.add_argument("--max-res", help="选 ≤ 该高度的最佳视频(自动发现可用高度)")
+    s.add_argument("--video-codec", help="视频编码过滤, 如 hvc1/avc1/av01/vp9")
+    s.add_argument("--video-all", action="store_true", help="下载所有视频流")
+    s.add_argument("--audio-lang", help="音频语言, 逗号分隔, 如 chi,eng,ja")
+    s.add_argument("--audio-codec", help="音频编码过滤, 如 mp4a/ec-3/ac-3")
+    s.add_argument("--audio-all", action="store_true", help="下载所有音频流")
+    s.add_argument("--sub-lang", help="字幕语言, 逗号分隔")
+    s.add_argument("--subs", action="store_true", help="附带最佳字幕")
+    s.add_argument("--sub-all", action="store_true", help="下载所有字幕")
+    s.add_argument("--video-only", action="store_true", help="只下视频")
+    s.add_argument("--audio-only", action="store_true", help="只下音频")
+    s.add_argument("--sub-only", action="store_true", help="只下字幕")
+    s.add_argument("--drop-video", action="append", default=[], help="丢弃匹配的视频(正则/子键)")
+    s.add_argument("--drop-audio", action="append", default=[], help="丢弃匹配的音频")
+    s.add_argument("--drop-sub", action="append", default=[], help="丢弃匹配的字幕")
+
+    # 输出
+    o = p.add_argument_group("输出")
+    o.add_argument("-o", "--output", help="输出文件路径(可含目录, 自动去扩展名)")
+    o.add_argument("-d", "--dir", default=".", help="输出目录 (默认当前目录)")
+    o.add_argument("--name", default="video", help="输出文件名(不含扩展名)")
+    o.add_argument("--tmp-dir", help="临时分片目录")
+    o.add_argument("--format", default="mp4", choices=["mp4", "mkv", "ts"], help="封装格式")
+    o.add_argument("--no-mux", action="store_true", help="不封装, 保留独立音视频文件")
+    o.add_argument("--keep-files", action="store_true", help="保留中间文件/分片")
+
+    # 网络
+    n = p.add_argument_group("网络 / 请求头")
+    n.add_argument("-H", "--header", action="append", default=[], help="自定义请求头(可重复)")
+    n.add_argument("--cookie", help="Cookie(快捷方式)")
+    n.add_argument("--user-agent", help="User-Agent(快捷方式)")
+    n.add_argument("--referer", help="Referer(快捷方式)")
+    n.add_argument("--append-url-params", action="store_true", help="把 URL 参数附加到分片请求")
+    n.add_argument("--proxy", help="代理, 如 http://127.0.0.1:7890")
+    n.add_argument("--no-proxy", action="store_true", help="禁用系统代理")
+
+    # 性能 / 解密
+    x = p.add_argument_group("性能 / 解密")
+    x.add_argument("--threads", type=int, default=8, help="下载线程数(并行下分片, 对应 yt-dlp -N)")
+    x.add_argument("--concurrent", action="store_true", help="视频/音频/字幕流同时下载(默认串行)")
+    x.add_argument("--retries", type=int, default=10, help="分片重试次数")
+    x.add_argument("--timeout", type=int, default=20, help="HTTP 超时(秒)")
+    x.add_argument("--max-speed", help="限速, 如 15M / 100K")
+    x.add_argument("--decrypt-engine", choices=["FFMPEG", "MP4DECRYPT", "SHAKA_PACKAGER"],
+                   default="MP4DECRYPT", help="解密引擎 (默认 MP4DECRYPT)")
+
+    # 其他
+    m = p.add_argument_group("其他")
+    m.add_argument("--list", action="store_true", help="只列出可用轨道, 不下载")
+    m.add_argument("--dry-run", action="store_true", help="只打印将执行的命令, 不下载")
+    m.add_argument("--binary", default=N_M3U8DL_RE, help="N_m3u8DL-RE 可执行文件路径")
+
+    args = p.parse_args()
+
+    # 输出路径处理
+    if args.output:
+        pth = os.path.normpath(args.output)
+        d, b = os.path.dirname(pth), os.path.basename(pth)
+        b = re.sub(r"\.[^.]+$", "", b)
+        if d and d != ".":
+            args.dir = d
+        if b:
+            args.name = b
+
+    # 收集 header (供 --list 抓取用)
+    headers = {}
+    for h in args.header:
+        if ":" in h:
+            kk, vv = h.split(":", 1)
+            headers[kk.strip()] = vv.strip()
+    if args.cookie:
+        headers["Cookie"] = args.cookie
+    if args.user_agent:
+        headers["User-Agent"] = args.user_agent
+    if args.referer:
+        headers["Referer"] = args.referer
+
+    # ── --list: 解析并打印轨道 ──
+    if args.list:
+        data = fetch(args.url, headers)
+        text = data.decode("utf-8", errors="replace").lstrip()
+        tracks = parse_mpd(data) if (text.startswith("<?xml") or text.startswith("<")) else parse_m3u8(text)
+        print(f"清单: {args.url}\n")
+        print_tracks(tracks)
+        return
+
+    # 需要选流时先解析清单(用于 --max-res 自动发现)
+    tracks = []
+    if args.max_res is not None:
+        try:
+            data = fetch(args.url, headers)
+            text = data.decode("utf-8", errors="replace").lstrip()
+            tracks = parse_mpd(data) if (text.startswith("<?xml") or text.startswith("<")) else parse_m3u8(text)
+        except Exception as e:
+            print(f"警告: 无法解析清单以发现分辨率 ({e}), 继续用精确匹配")
+
+    cmd = build_command(args, args.binary, tracks)
+
+    if args.dry_run:
+        print("将执行:")
+        print("  " + " ".join(f"'{c}'" if " " in c else c for c in cmd))
+        return
+
+    print("执行:", " ".join(f"'{c}'" if " " in c else c for c in cmd), "\n")
+    sys.exit(subprocess.call(cmd))
+
+
+if __name__ == "__main__":
+    main()
